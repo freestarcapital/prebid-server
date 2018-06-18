@@ -1,5 +1,6 @@
 FROM golang:alpine
 ##MAINTAINER Brian O'Kelley <bokelley@appnexus.com>
+RUN apk add --no-cache git
 
 ## GO BUILD STUFF
 WORKDIR /go/src/github.com/prebid/prebid-server
