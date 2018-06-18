@@ -1,4 +1,4 @@
-FROM golang:latest
+FROM golang:alpine
 ##MAINTAINER Brian O'Kelley <bokelley@appnexus.com>
 
 ## GO BUILD STUFF
