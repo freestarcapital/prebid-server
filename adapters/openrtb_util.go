@@ -3,8 +3,6 @@ package adapters
 import (
 	"github.com/prebid/prebid-server/pbs"
 
-	"errors"
-
 	"github.com/mxmCherry/openrtb"
 )
 
@@ -100,7 +98,9 @@ func MakeOpenRTBGeneric(req *pbs.PBSRequest, bidder *pbs.PBSBidder, bidderFamily
 				case pbs.MEDIA_TYPE_VIDEO:
 					video := makeVideo(unit)
 					if video == nil {
-						return openrtb.BidRequest{}, errors.New("Invalid AdUnit: VIDEO media type with no video data")
+						return openrtb.BidRequest{}, &BadInputError{
+							Message: "Invalid AdUnit: VIDEO media type with no video data",
+						}
 					}
 					newImp.Video = video
 				default:
@@ -131,7 +131,9 @@ func MakeOpenRTBGeneric(req *pbs.PBSRequest, bidder *pbs.PBSBidder, bidderFamily
 	}
 
 	if len(imps) < 1 {
-		return openrtb.BidRequest{}, errors.New("openRTB bids need at least one Imp")
+		return openrtb.BidRequest{}, &BadInputError{
+			Message: "openRTB bids need at least one Imp",
+		}
 	}
 
 	if req.App != nil {
@@ -146,11 +148,17 @@ func MakeOpenRTBGeneric(req *pbs.PBSRequest, bidder *pbs.PBSBidder, bidderFamily
 			},
 			AT:   1,
 			TMax: req.TimeoutMillis,
+			Regs: req.Regs,
 		}, nil
 	}
 
 	buyerUID, _, _ := req.Cookie.GetUID(bidderFamily)
 	id, _, _ := req.Cookie.GetUID("adnxs")
+
+	var userExt openrtb.RawJSON
+	if req.User != nil {
+		userExt = req.User.Ext
+	}
 
 	return openrtb.BidRequest{
 		ID:  req.Tid,
@@ -163,6 +171,7 @@ func MakeOpenRTBGeneric(req *pbs.PBSRequest, bidder *pbs.PBSBidder, bidderFamily
 		User: &openrtb.User{
 			BuyerUID: buyerUID,
 			ID:       id,
+			Ext:      userExt,
 		},
 		Source: &openrtb.Source{
 			FD:  1, // upstream, aka header
@@ -170,6 +179,7 @@ func MakeOpenRTBGeneric(req *pbs.PBSRequest, bidder *pbs.PBSBidder, bidderFamily
 		},
 		AT:   1,
 		TMax: req.TimeoutMillis,
+		Regs: req.Regs,
 	}, nil
 }
 

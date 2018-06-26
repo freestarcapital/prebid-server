@@ -115,16 +115,19 @@ func (bidder *bidderAdapter) requestBid(ctx context.Context, request *openrtb.Bi
 		}
 
 		if httpInfo.err == nil {
-			bids, moreErrs := bidder.Bidder.MakeBids(request, httpInfo.request, httpInfo.response)
+			bidResponse, moreErrs := bidder.Bidder.MakeBids(request, httpInfo.request, httpInfo.response)
 			errs = append(errs, moreErrs...)
-			for i := 0; i < len(bids); i++ {
-				if bids[i].Bid != nil {
-					bids[i].Bid.Price = bids[i].Bid.Price * bidAdjustment
+			if bidResponse != nil {
+				for i := 0; i < len(bidResponse.Bids); i++ {
+					if bidResponse.Bids[i].Bid != nil {
+						// TODO #280: Convert the bid price
+						bidResponse.Bids[i].Bid.Price = bidResponse.Bids[i].Bid.Price * bidAdjustment
+					}
+					seatBid.bids = append(seatBid.bids, &pbsOrtbBid{
+						bid:     bidResponse.Bids[i].Bid,
+						bidType: bidResponse.Bids[i].BidType,
+					})
 				}
-				seatBid.bids = append(seatBid.bids, &pbsOrtbBid{
-					bid:     bids[i].Bid,
-					bidType: bids[i].BidType,
-				})
 			}
 		} else {
 			errs = append(errs, httpInfo.err)
@@ -183,7 +186,9 @@ func (bidder *bidderAdapter) doRequest(ctx context.Context, req *adapters.Reques
 	defer httpResp.Body.Close()
 
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 400 {
-		err = fmt.Errorf("Server responded with failure status: %d. Set request.test = 1 for debugging info.", httpResp.StatusCode)
+		err = &adapters.BadServerResponseError{
+			Message: fmt.Sprintf("Server responded with failure status: %d. Set request.test = 1 for debugging info.", httpResp.StatusCode),
+		}
 	}
 
 	return &httpCallInfo{
