@@ -9,7 +9,7 @@ import (
 	"io/ioutil"
 	"math/rand"
 	"net/http"
-	_ "net/http/pprof"
+	"net/http/pprof"
 	"sort"
 	"strconv"
 	"time"
@@ -20,11 +20,6 @@ import (
 	"github.com/mssola/user_agent"
 	"github.com/rs/cors"
 	"github.com/spf13/viper"
-	"github.com/xeipuuv/gojsonschema"
-
-	"os"
-	"os/signal"
-	"syscall"
 
 	"crypto/tls"
 	"strings"
@@ -41,35 +36,40 @@ import (
 	"github.com/prebid/prebid-server/adapters/pulsepoint"
 	"github.com/prebid/prebid-server/adapters/rubicon"
 	"github.com/prebid/prebid-server/adapters/sovrn"
-	"github.com/prebid/prebid-server/analytics"
+	analyticsConf "github.com/prebid/prebid-server/analytics/config"
 	"github.com/prebid/prebid-server/cache"
 	"github.com/prebid/prebid-server/cache/dummycache"
 	"github.com/prebid/prebid-server/cache/filecache"
 	"github.com/prebid/prebid-server/cache/postgrescache"
 	"github.com/prebid/prebid-server/config"
+	"github.com/prebid/prebid-server/endpoints"
 	infoEndpoints "github.com/prebid/prebid-server/endpoints/info"
 	"github.com/prebid/prebid-server/endpoints/openrtb2"
 	"github.com/prebid/prebid-server/exchange"
+	"github.com/prebid/prebid-server/gdpr"
 	"github.com/prebid/prebid-server/openrtb_ext"
 	"github.com/prebid/prebid-server/pbs"
-	"github.com/prebid/prebid-server/pbs/buckets"
 	"github.com/prebid/prebid-server/pbsmetrics"
+	metricsConf "github.com/prebid/prebid-server/pbsmetrics/config"
 	pbc "github.com/prebid/prebid-server/prebid_cache_client"
+	"github.com/prebid/prebid-server/server"
 	"github.com/prebid/prebid-server/ssl"
-	"github.com/prebid/prebid-server/stored_requests"
-	"github.com/prebid/prebid-server/stored_requests/backends/db_fetcher"
-	"github.com/prebid/prebid-server/stored_requests/backends/empty_fetcher"
-	"github.com/prebid/prebid-server/stored_requests/backends/file_fetcher"
-	"github.com/prebid/prebid-server/stored_requests/backends/http_fetcher"
-	"github.com/prebid/prebid-server/stored_requests/caches/in_memory"
-	usersyncers "github.com/prebid/prebid-server/usersync"
+	"github.com/prebid/prebid-server/usersync"
+	"github.com/prebid/prebid-server/usersync/usersyncers"
+
+	storedRequestsConf "github.com/prebid/prebid-server/stored_requests/config"
 )
 
-var hostCookieSettings pbs.HostCookieSettings
+// Holds binary revision string
+// Set manually at build time using:
+//    go build -ldflags "-X main.Rev=`git rev-parse --short HEAD`"
+// Populated automatically at build / release time via .travis.yml
+//   `gox -os="linux" -arch="386" -output="{{.Dir}}_{{.OS}}_{{.Arch}}" -ldflags "-X main.Rev=`git rev-parse --short HEAD`" -verbose ./...;`
+// See issue #559
+var Rev string
 
 var exchanges map[string]adapters.Adapter
 var dataCache cache.Cache
-var reqSchema *gojsonschema.Schema
 
 type bidResult struct {
 	bidder   *pbs.PBSBidder
@@ -116,115 +116,10 @@ func writeAuctionError(w http.ResponseWriter, s string, err error) {
 	}
 }
 
-type cookieSyncRequest struct {
-	Bidders []string `json:"bidders"`
-}
-
-type cookieSyncResponse struct {
-	Status       string                           `json:"status"`
-	BidderStatus []*usersyncers.CookieSyncBidders `json:"bidder_status"`
-}
-
-type cookieSyncDeps struct {
-	syncers      map[openrtb_ext.BidderName]usersyncers.Usersyncer
-	optOutCookie *config.Cookie
-	metric       pbsmetrics.MetricsEngine
-	pbsAnalytics analytics.PBSAnalyticsModule
-}
-
-func (deps *cookieSyncDeps) CookieSync(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
-
-	//CookieSyncObject makes a log of requests and responses to  /cookie_sync endpoint
-	co := analytics.CookieSyncObject{
-		Status:       http.StatusOK,
-		Errors:       make([]error, 0),
-		BidderStatus: make([]*usersyncers.CookieSyncBidders, 0),
-	}
-
-	defer deps.pbsAnalytics.LogCookieSyncObject(&co)
-
-	deps.metric.RecordCookieSync(pbsmetrics.Labels{})
-	userSyncCookie := pbs.ParsePBSCookieFromRequest(r, deps.optOutCookie)
-	if !userSyncCookie.AllowSyncs() {
-		http.Error(w, "User has opted out", http.StatusUnauthorized)
-		co.Status = http.StatusUnauthorized
-		co.Errors = append(co.Errors, fmt.Errorf("user has opted out"))
-		return
-	}
-
-	defer r.Body.Close()
-
-	csReq := &cookieSyncRequest{}
-	csReqRaw := map[string]json.RawMessage{}
-	err := json.NewDecoder(r.Body).Decode(&csReqRaw)
-	if err != nil {
-		if glog.V(2) {
-			glog.Infof("Failed to parse /cookie_sync request body: %v", err)
-		}
-		co.Status = http.StatusBadRequest
-		co.Errors = append(co.Errors, fmt.Errorf("JSON parse failed"))
-		http.Error(w, "JSON parse failed", http.StatusBadRequest)
-		return
-	}
-	biddersOmitted := true
-	if biddersRaw, ok := csReqRaw["bidders"]; ok {
-		biddersOmitted = false
-		err := json.Unmarshal(biddersRaw, &csReq.Bidders)
-		if err != nil {
-			if glog.V(2) {
-				glog.Infof("Failed to parse /cookie_sync request body (bidders list): %v", err)
-			}
-			co.Status = http.StatusBadRequest
-			co.Errors = append(co.Errors, fmt.Errorf("JSON parse failed (bidders"))
-			http.Error(w, "JSON parse failed (bidders)", http.StatusBadRequest)
-			return
-		}
-	}
-
-	csResp := cookieSyncResponse{
-		BidderStatus: make([]*usersyncers.CookieSyncBidders, 0, len(csReq.Bidders)),
-	}
-
-	if userSyncCookie.LiveSyncCount() == 0 {
-		csResp.Status = "no_cookie"
-	} else {
-		csResp.Status = "ok"
-	}
-
-	// If at the end (After possibly reading stored bidder lists) there still are no bidders,
-	// and "bidders" is not found in the JSON, sync all bidders
-	if len(csReq.Bidders) == 0 && biddersOmitted {
-		for bidder := range deps.syncers {
-			csReq.Bidders = append(csReq.Bidders, string(bidder))
-		}
-	}
-
-	for _, bidder := range csReq.Bidders {
-		if syncer, ok := deps.syncers[openrtb_ext.BidderName(bidder)]; ok {
-			if !userSyncCookie.HasLiveSync(syncer.FamilyName()) {
-				b := usersyncers.CookieSyncBidders{
-					BidderCode:   bidder,
-					NoCookie:     true,
-					UsersyncInfo: syncer.GetUsersyncInfo(),
-				}
-				csResp.BidderStatus = append(csResp.BidderStatus, &b)
-			}
-		}
-	}
-
-	if len(csResp.BidderStatus) > 0 {
-		co.BidderStatus = append(co.BidderStatus, csResp.BidderStatus...)
-	}
-
-	enc := json.NewEncoder(w)
-	enc.SetEscapeHTML(false)
-	//enc.SetIndent("", "  ")
-	enc.Encode(csResp)
-}
-
 type auctionDeps struct {
 	cfg           *config.Configuration
-	syncers       map[openrtb_ext.BidderName]usersyncers.Usersyncer
+	syncers       map[openrtb_ext.BidderName]usersync.Usersyncer
+	gdprPerms     gdpr.Permissions
 	metricsEngine pbsmetrics.MetricsEngine
 }
 
@@ -247,7 +142,7 @@ func (deps *auctionDeps) auction(w http.ResponseWriter, r *http.Request, _ httpr
 		}
 	}
 
-	pbs_req, err := pbs.ParsePBSRequest(r, dataCache, &hostCookieSettings)
+	pbs_req, err := pbs.ParsePBSRequest(r, &deps.cfg.AuctionTimeouts, dataCache, &(deps.cfg.HostCookie))
 	// Defer here because we need pbs_req defined.
 	defer func() {
 		if pbs_req == nil {
@@ -266,7 +161,7 @@ func (deps *auctionDeps) auction(w http.ResponseWriter, r *http.Request, _ httpr
 			glog.Infof("Failed to parse /auction request: %v", err)
 		}
 		writeAuctionError(w, "Error parsing request", err)
-		labels.RequestStatus = pbsmetrics.RequestStatusErr
+		labels.RequestStatus = pbsmetrics.RequestStatusBadInput
 		return
 	}
 
@@ -292,7 +187,7 @@ func (deps *auctionDeps) auction(w http.ResponseWriter, r *http.Request, _ httpr
 			glog.Infof("Invalid account id: %v", err)
 		}
 		writeAuctionError(w, "Unknown account id", fmt.Errorf("Unknown account"))
-		labels.RequestStatus = pbsmetrics.RequestStatusErr
+		labels.RequestStatus = pbsmetrics.RequestStatusBadInput
 		return
 	}
 	labels.PubID = pbs_req.AccountID
@@ -305,20 +200,22 @@ func (deps *auctionDeps) auction(w http.ResponseWriter, r *http.Request, _ httpr
 
 	ch := make(chan bidResult)
 	sentBids := 0
-	bidderLabels := make(map[string]*pbsmetrics.AdapterLabels)
 	for _, bidder := range pbs_req.Bidders {
 		if ex, ok := exchanges[bidder.BidderCode]; ok {
 			// Make sure we have an independent label struct for each bidder. We don't want to run into issues with the goroutine below.
 			blabels := pbsmetrics.AdapterLabels{
-				Source:        labels.Source,
-				RType:         labels.RType,
-				Adapter:       openrtb_ext.BidderMap[bidder.BidderCode],
-				PubID:         labels.PubID,
-				Browser:       labels.Browser,
-				CookieFlag:    labels.CookieFlag,
-				AdapterStatus: pbsmetrics.AdapterStatusOK,
+				Source:      labels.Source,
+				RType:       labels.RType,
+				Adapter:     openrtb_ext.BidderMap[bidder.BidderCode],
+				PubID:       labels.PubID,
+				Browser:     labels.Browser,
+				CookieFlag:  labels.CookieFlag,
+				AdapterBids: pbsmetrics.AdapterBidPresent,
 			}
-			bidderLabels[bidder.BidderCode] = &blabels
+			if blabels.Adapter == "" {
+				// "districtm" is legal, but not in BidderMap. Other values will log errors in the go_metrics code
+				blabels.Adapter = openrtb_ext.BidderName(bidder.BidderCode)
+			}
 			if pbs_req.App == nil {
 				// If exchanges[bidderCode] exists, then deps.syncers[bidderCode] exists *except for districtm*.
 				// OpenRTB handles aliases differently, so this hack will keep legacy code working. For all other
@@ -334,7 +231,11 @@ func (deps *auctionDeps) auction(w http.ResponseWriter, r *http.Request, _ httpr
 				uid, _, _ := pbs_req.Cookie.GetUID(syncer.FamilyName())
 				if uid == "" {
 					bidder.NoCookie = true
-					bidder.UsersyncInfo = syncer.GetUsersyncInfo()
+					gdprApplies := pbs_req.ParseGDPR()
+					consent := pbs_req.ParseConsent()
+					if deps.shouldUsersync(ctx, openrtb_ext.BidderName(syncerCode), gdprApplies, consent) {
+						bidder.UsersyncInfo = syncer.GetUsersyncInfo(gdprApplies, consent)
+					}
 					blabels.CookieFlag = pbsmetrics.CookieFlagNo
 					if ex.SkipNoCookies() {
 						continue
@@ -348,29 +249,42 @@ func (deps *auctionDeps) auction(w http.ResponseWriter, r *http.Request, _ httpr
 				deps.metricsEngine.RecordAdapterTime(blabels, time.Since(start))
 				bidder.ResponseTime = int(time.Since(start) / time.Millisecond)
 				if err != nil {
+					var s struct{}
 					switch err {
 					case context.DeadlineExceeded:
-						bidderLabels[bidder.BidderCode].AdapterStatus = pbsmetrics.AdapterStatusTimeout
+						blabels.AdapterErrors = map[pbsmetrics.AdapterError]struct{}{pbsmetrics.AdapterErrorTimeout: s}
 						bidder.Error = "Timed out"
 					case context.Canceled:
 						fallthrough
 					default:
-						bidderLabels[bidder.BidderCode].AdapterStatus = pbsmetrics.AdapterStatusErr
 						bidder.Error = err.Error()
-						glog.Warningf("Error from bidder %v. Ignoring all bids: %v", bidder.BidderCode, err)
+						switch err.(type) {
+						case *adapters.BadInputError:
+							blabels.AdapterErrors = map[pbsmetrics.AdapterError]struct{}{pbsmetrics.AdapterErrorBadInput: s}
+						case *adapters.BadServerResponseError:
+							blabels.AdapterErrors = map[pbsmetrics.AdapterError]struct{}{pbsmetrics.AdapterErrorBadServerResponse: s}
+						default:
+							glog.Warningf("Error from bidder %v. Ignoring all bids: %v", bidder.BidderCode, err)
+							blabels.AdapterErrors = map[pbsmetrics.AdapterError]struct{}{pbsmetrics.AdapterErrorUnknown: s}
+						}
 					}
 				} else if bid_list != nil {
 					bid_list = checkForValidBidSize(bid_list, bidder)
 					bidder.NumBids = len(bid_list)
-					deps.metricsEngine.RecordAdapterBidsReceived(blabels, int64(bidder.NumBids))
 					for _, bid := range bid_list {
 						var cpm = float64(bid.Price * 1000)
 						deps.metricsEngine.RecordAdapterPrice(blables, cpm)
+						switch bid.CreativeMediaType {
+						case "banner":
+							deps.metricsEngine.RecordAdapterBidReceived(blabels, openrtb_ext.BidTypeBanner, bid.Adm != "")
+						case "video":
+							deps.metricsEngine.RecordAdapterBidReceived(blabels, openrtb_ext.BidTypeVideo, bid.Adm != "")
+						}
 						bid.ResponseTime = bidder.ResponseTime
 					}
 				} else {
 					bidder.NoBid = true
-					bidderLabels[bidder.BidderCode].AdapterStatus = pbsmetrics.AdapterStatusNoBid
+					blabels.AdapterBids = pbsmetrics.AdapterBidNone
 				}
 
 				ch <- bidResult{
@@ -444,6 +358,24 @@ func (deps *auctionDeps) auction(w http.ResponseWriter, r *http.Request, _ httpr
 	enc.Encode(pbs_resp)
 }
 
+func (deps *auctionDeps) shouldUsersync(ctx context.Context, bidder openrtb_ext.BidderName, gdprApplies string, consent string) bool {
+	switch gdprApplies {
+	case "0":
+		return true
+	case "1":
+		if consent == "" {
+			return false
+		}
+		fallthrough
+	default:
+		if canSync, err := deps.gdprPerms.HostCookiesAllowed(ctx, consent); !canSync || err != nil {
+			return false
+		}
+		canSync, err := deps.gdprPerms.BidderSyncAllowed(ctx, bidder, consent)
+		return canSync && err == nil
+	}
+}
+
 // cache video bids only for Web
 func cacheVideoOnly(bids pbs.PBSBidSlice, ctx context.Context, w http.ResponseWriter, deps *auctionDeps, labels *pbsmetrics.Labels) {
 	var cobjs []*pbc.CacheObject
@@ -507,7 +439,7 @@ bidLoop:
 // sortBidsAddKeywordsMobile sorts the bids and adds ad server targeting keywords to each bid.
 // The bids are sorted by cpm to find the highest bid.
 // The ad server targeting keywords are added to all bids, with specific keywords for the highest bid.
-func sortBidsAddKeywordsMobile(bids pbs.PBSBidSlice, pbs_req *pbs.PBSRequest, priceGranularitySetting openrtb_ext.PriceGranularity) {
+func sortBidsAddKeywordsMobile(bids pbs.PBSBidSlice, pbs_req *pbs.PBSRequest, priceGranularitySetting string) {
 	if priceGranularitySetting == "" {
 		priceGranularitySetting = defaultPriceGranularity
 	}
@@ -533,7 +465,7 @@ func sortBidsAddKeywordsMobile(bids pbs.PBSBidSlice, pbs_req *pbs.PBSRequest, pr
 		// after sorting we need to add the ad targeting keywords
 		for i, bid := range bar {
 			// We should eventually check for the error and do something.
-			roundedCpm, err := buckets.GetPriceBucketString(bid.Price, priceGranularitySetting)
+			roundedCpm, err := exchange.GetCpmStringValue(bid.Price, openrtb_ext.PriceGranularityFromString(priceGranularitySetting))
 			if err != nil {
 				glog.Error(err.Error())
 			}
@@ -595,10 +527,6 @@ func sortBidsAddKeywordsMobile(bids pbs.PBSBidSlice, pbs_req *pbs.PBSRequest, pr
 	}
 }
 
-func status(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
-	w.Write([]byte("ready"))
-}
-
 // NewJsonDirectoryServer is used to serve .json files from a directory as a single blob. For example,
 // given a directory containing the files "a.json" and "b.json", this returns a Handle which serves JSON like:
 //
@@ -651,39 +579,6 @@ func (m NoCache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	m.handler.ServeHTTP(w, r)
 }
 
-func validate(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
-	w.Header().Add("Content-Type", "text/plain")
-	defer r.Body.Close()
-	b, err := ioutil.ReadAll(r.Body)
-	if err != nil {
-		fmt.Fprintf(w, "Unable to read body\n")
-		return
-	}
-
-	if reqSchema == nil {
-		fmt.Fprintf(w, "Validation schema not loaded\n")
-		return
-	}
-
-	js := gojsonschema.NewStringLoader(string(b))
-	result, err := reqSchema.Validate(js)
-	if err != nil {
-		fmt.Fprintf(w, "Error parsing json: %v\n", err)
-		return
-	}
-
-	if result.Valid() {
-		fmt.Fprintf(w, "Validation successful\n")
-		return
-	}
-
-	for _, err := range result.Errors() {
-		fmt.Fprintf(w, "Error: %s %v\n", err.Context().String(), err)
-	}
-
-	return
-}
-
 func loadDataCache(cfg *config.Configuration, db *sql.DB) (err error) {
 	switch cfg.DataCache.Type {
 	case "dummy":
@@ -717,53 +612,19 @@ func loadDataCache(cfg *config.Configuration, db *sql.DB) (err error) {
 
 func init() {
 	rand.Seed(time.Now().UnixNano())
-	viper.SetConfigName("pbs")
-	viper.AddConfigPath(".")
-	viper.AddConfigPath("/etc/config")
-
-	viper.SetDefault("external_url", "http://localhost:8000")
-	viper.SetDefault("port", 8000)
-	viper.SetDefault("admin_port", 6060)
-	viper.SetDefault("default_timeout_ms", 250)
-	viper.SetDefault("cache.expected_millis", 10)
-	viper.SetDefault("datacache.type", "dummy")
-	// no metrics configured by default (metrics{host|database|username|password})
-
-	viper.SetDefault("stored_requests.filesystem", "true")
-
-	// This Appnexus endpoint works for most purposes. Docs can be found at https://wiki.appnexus.com/display/supply/Incoming+Bid+Request+from+SSPs
-	viper.SetDefault("adapters.appnexus.endpoint", "http://ib.adnxs.com/openrtb2")
-
-	viper.SetDefault("adapters.pubmatic.endpoint", "http://hbopenbid.pubmatic.com/translator?source=prebid-server")
-	viper.SetDefault("adapters.rubicon.endpoint", "http://exapi-us-east.rubiconproject.com/a/api/exchange.json")
-	viper.SetDefault("adapters.rubicon.usersync_url", "https://pixel.rubiconproject.com/exchange/sync.php?p=prebid")
-	viper.SetDefault("adapters.pulsepoint.endpoint", "http://bid.contextweb.com/header/s/ortb/prebid-s2s")
-	viper.SetDefault("adapters.index.usersync_url", "//ssum-sec.casalemedia.com/usermatchredir?s=184932&cb=https%3A%2F%2Fprebid.adnxs.com%2Fpbs%2Fv1%2Fsetuid%3Fbidder%3DindexExchange%26uid%3D")
-	viper.SetDefault("adapters.sovrn.endpoint", "http://ap.lijit.com/rtb/bid?src=prebid_server")
-	viper.SetDefault("adapters.sovrn.usersync_url", "//ap.lijit.com/pixel?")
-	viper.SetDefault("adapters.adform.endpoint", "http://adx.adform.net/adx")
-	viper.SetDefault("adapters.adform.usersync_url", "//cm.adform.net/cookie?redirect_url=")
-	viper.SetDefault("max_request_size", 1024*256)
-	viper.SetDefault("adapters.conversant.endpoint", "http://media.msg.dotomi.com/s2s/header/24")
-	viper.SetDefault("adapters.conversant.usersync_url", "http://prebid-match.dotomi.com/prebid/match?rurl=")
-	viper.SetDefault("host_cookie.ttl_days", 90)
-
-	// Set environment variable support:
-	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
-	viper.SetEnvPrefix("PBS")
-	viper.AutomaticEnv()
-	viper.ReadInConfig()
 
 	flag.Parse() // read glog settings from cmd line
 }
 
 func main() {
-	cfg, err := config.New(viper.GetViper())
+	v := viper.New()
+	config.SetupViper(v)
+	cfg, err := config.New(v)
 	if err != nil {
-		glog.Fatalf("Viper was unable to read configurations: %v", err)
+		glog.Fatalf("Configuration could not be loaded or did not pass validation: %v", err)
 	}
 
-	if err := serve(cfg); err != nil {
+	if err := serve(Rev, cfg); err != nil {
 		glog.Errorf("prebid-server failed: %v", err)
 	}
 }
@@ -786,58 +647,8 @@ func newExchangeMap(cfg *config.Configuration) map[string]adapters.Adapter {
 	}
 }
 
-func serve(cfg *config.Configuration) error {
-	var db *sql.DB
-	if cfg.StoredRequests.Postgres != nil {
-		if conn, err := db_fetcher.NewPostgresDb(cfg.StoredRequests.Postgres); err != nil {
-			glog.Fatalf("Failed to connect to postgres: %v", err)
-		} else {
-			db = conn
-		}
-	}
-	if err := loadDataCache(cfg, db); err != nil {
-		return fmt.Errorf("Prebid Server could not load data cache: %v", err)
-	}
-
-	pbsAnalytics := analytics.NewPBSAnalytics(&cfg.Analytics)
-
-	// Hack because of how legacy handles districtm
-	bidderList := openrtb_ext.BidderList()
-	bidderList = append(bidderList, openrtb_ext.BidderName("districtm"))
-
-	metricsEngine := pbsmetrics.NewMetricsEngine(cfg, bidderList)
-
-	b, err := ioutil.ReadFile("static/pbs_request.json")
-	if err != nil {
-		glog.Errorf("Unable to open pbs_request.json: %v", err)
-	} else {
-		sl := gojsonschema.NewStringLoader(string(b))
-		reqSchema, err = gojsonschema.NewSchema(sl)
-		if err != nil {
-			glog.Errorf("Unable to load request schema: %v", err)
-		}
-	}
-
-	stopSignals := make(chan os.Signal)
-	signal.Notify(stopSignals, syscall.SIGTERM, syscall.SIGINT)
-
-	/* Run admin on different port thats not exposed */
-	adminURI := fmt.Sprintf("%s:%d", cfg.Host, cfg.AdminPort)
-	adminServer := &http.Server{Addr: adminURI}
-	go (func() {
-		fmt.Println("Admin running on: ", adminURI)
-		err := adminServer.ListenAndServe()
-		glog.Errorf("Admin server: %v", err)
-		stopSignals <- syscall.SIGTERM
-	})()
-
-	paramsValidator, err := openrtb_ext.NewBidderParamsValidator(schemaDirectory)
-	if err != nil {
-		glog.Fatalf("Failed to create the bidder params validator. %v", err)
-	}
-
-	exchanges = newExchangeMap(cfg)
-
+func serve(revision string, cfg *config.Configuration) error {
+	router := httprouter.New()
 	theClient := &http.Client{
 		Transport: &http.Transport{
 			MaxIdleConns:        400,
@@ -846,58 +657,64 @@ func serve(cfg *config.Configuration) error {
 			TLSClientConfig:     &tls.Config{RootCAs: ssl.GetRootCAPool()},
 		},
 	}
-	theExchange := exchange.NewExchange(theClient, pbc.NewClient(&cfg.CacheURL), cfg, metricsEngine)
+	fetcher, ampFetcher, db, shutdown := storedRequestsConf.NewStoredRequests(&cfg.StoredRequests, theClient, router)
+	defer shutdown()
 
-	byId, byAmpId, err := NewFetchers(&(cfg.StoredRequests), db)
-	if err != nil {
-		glog.Fatalf("Failed to initialize config backends. %v", err)
+	if err := loadDataCache(cfg, db); err != nil {
+		return fmt.Errorf("Prebid Server could not load data cache: %v", err)
 	}
 
-	openrtbEndpoint, err := openrtb2.NewEndpoint(theExchange, paramsValidator, byId, cfg, metricsEngine, pbsAnalytics)
+	pbsAnalytics := analyticsConf.NewPBSAnalytics(&cfg.Analytics)
+
+	// Hack because of how legacy handles districtm
+	bidderList := openrtb_ext.BidderList()
+	bidderList = append(bidderList, openrtb_ext.BidderName("districtm"))
+
+	metricsEngine := metricsConf.NewMetricsEngine(cfg, bidderList)
+
+	paramsValidator, err := openrtb_ext.NewBidderParamsValidator(schemaDirectory)
+	if err != nil {
+		glog.Fatalf("Failed to create the bidder params validator. %v", err)
+	}
+
+	exchanges = newExchangeMap(cfg)
+	theExchange := exchange.NewExchange(theClient, pbc.NewClient(&cfg.CacheURL), cfg, metricsEngine)
+
+	openrtbEndpoint, err := openrtb2.NewEndpoint(theExchange, paramsValidator, fetcher, cfg, metricsEngine, pbsAnalytics)
 	if err != nil {
 		glog.Fatalf("Failed to create the openrtb endpoint handler. %v", err)
 	}
 
-	ampEndpoint, err := openrtb2.NewAmpEndpoint(theExchange, paramsValidator, byAmpId, cfg, metricsEngine, pbsAnalytics)
+	ampEndpoint, err := openrtb2.NewAmpEndpoint(theExchange, paramsValidator, ampFetcher, cfg, metricsEngine, pbsAnalytics)
 	if err != nil {
 		glog.Fatalf("Failed to create the amp endpoint handler. %v", err)
 	}
 
 	syncers := usersyncers.NewSyncerMap(cfg)
+	gdprPerms := gdpr.NewPermissions(context.Background(), cfg.GDPR, usersyncers.GDPRAwareSyncerIDs(syncers), theClient)
 
-	router := httprouter.New()
-	router.POST("/auction", (&auctionDeps{cfg, syncers, metricsEngine}).auction)
+	bidderInfos := adapters.ParseBidderInfos("./static/bidder-info", openrtb_ext.BidderList())
+
+	router.POST("/auction", (&auctionDeps{cfg, syncers, gdprPerms, metricsEngine}).auction)
 	router.POST("/openrtb2/auction", openrtbEndpoint)
 	router.GET("/openrtb2/amp", ampEndpoint)
 	router.GET("/info/bidders", infoEndpoints.NewBiddersEndpoint())
-	router.GET("/info/bidders/:bidderName", infoEndpoints.NewBidderDetailsEndpoint("./static/bidder-info", openrtb_ext.BidderList()))
+	router.GET("/info/bidders/:bidderName", infoEndpoints.NewBidderDetailsEndpoint(bidderInfos))
 	router.GET("/bidders/params", NewJsonDirectoryServer(paramsValidator))
-	router.POST("/cookie_sync", (&cookieSyncDeps{syncers, &(hostCookieSettings.OptOutCookie), metricsEngine, pbsAnalytics}).CookieSync)
-	router.POST("/validate", validate)
-	router.GET("/status", status)
+	router.POST("/cookie_sync", endpoints.NewCookieSyncEndpoint(syncers, &(cfg.HostCookie), gdprPerms, metricsEngine, pbsAnalytics))
+	router.GET("/status", endpoints.NewStatusEndpoint(cfg.StatusResponse))
 	router.GET("/", serveIndex)
 	router.ServeFiles("/static/*filepath", http.Dir("static"))
 
-	hostCookieSettings = pbs.HostCookieSettings{
-		Domain:       cfg.HostCookie.Domain,
-		Family:       cfg.HostCookie.Family,
-		CookieName:   cfg.HostCookie.CookieName,
-		OptOutURL:    cfg.HostCookie.OptOutURL,
-		OptInURL:     cfg.HostCookie.OptInURL,
-		OptOutCookie: cfg.HostCookie.OptOutCookie,
-		TTL:          time.Duration(cfg.HostCookie.TTL) * 24 * time.Hour,
-	}
-
 	userSyncDeps := &pbs.UserSyncDeps{
-		HostCookieSettings: &hostCookieSettings,
-		ExternalUrl:        cfg.ExternalURL,
-		RecaptchaSecret:    cfg.RecaptchaSecret,
-		MetricsEngine:      metricsEngine,
-		PBSAnalytics:       pbsAnalytics,
+		HostCookieConfig: &(cfg.HostCookie),
+		ExternalUrl:      cfg.ExternalURL,
+		RecaptchaSecret:  cfg.RecaptchaSecret,
+		MetricsEngine:    metricsEngine,
+		PBSAnalytics:     pbsAnalytics,
 	}
 
-	router.GET("/getuids", userSyncDeps.GetUIDs)
-	router.GET("/setuid", userSyncDeps.SetUID)
+	router.GET("/setuid", endpoints.NewSetUIDEndpoint(cfg.HostCookie, gdprPerms, pbsAnalytics, metricsEngine))
 	router.POST("/optout", userSyncDeps.OptOut)
 	router.GET("/optout", userSyncDeps.OptOut)
 
@@ -912,81 +729,20 @@ func serve(cfg *config.Configuration) error {
 	// Add no cache headers
 	noCacheHandler := NoCache{corsRouter}
 
-	server := &http.Server{
-		Addr:         fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
-		Handler:      noCacheHandler,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
-	}
+	// Add endpoints to the admin server
+	// Making sure to add pprof routes
+	adminRouter := http.NewServeMux()
 
-	go (func() {
-		fmt.Printf("Main server running on: %s\n", server.Addr)
-		serverErr := server.ListenAndServe()
-		glog.Errorf("Main server: %v", serverErr)
-		stopSignals <- syscall.SIGTERM
-	})()
+	// Register pprof handlers
+	adminRouter.HandleFunc("/debug/pprof/", pprof.Index)
+	adminRouter.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	adminRouter.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	adminRouter.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	adminRouter.HandleFunc("/debug/pprof/trace", pprof.Trace)
 
-	<-stopSignals
+	// Register prebid-server defined admin handlers
+	adminRouter.HandleFunc("/version", endpoints.NewVersionEndpoint(revision))
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if err := server.Shutdown(ctx); err != nil {
-		glog.Errorf("Main server shutdown: %v", err)
-	}
-	if err := adminServer.Shutdown(ctx); err != nil {
-		glog.Errorf("Admin server shutdown: %v", err)
-	}
-
+	server.Listen(cfg, noCacheHandler, adminRouter, metricsEngine)
 	return nil
-}
-
-const requestConfigPath = "./stored_requests/data/by_id"
-
-// NewFetchers returns an Account-based config fetcher and a Request-based config fetcher, in that order.
-// If it can't generate both of those from the given config, then an error will be returned.
-//
-// This function assumes that the argument config has been validated.
-func NewFetchers(cfg *config.StoredRequests, db *sql.DB) (byId stored_requests.Fetcher, byAmpId stored_requests.Fetcher, err error) {
-	idList := make(stored_requests.MultiFetcher, 0, 3)
-	ampIdList := make(stored_requests.MultiFetcher, 0, 3)
-	if cfg.Files {
-		glog.Infof("Loading Stored Requests from filesystem at path %s", requestConfigPath)
-		byId, err = file_fetcher.NewFileFetcher(requestConfigPath)
-		idList = append(idList, byId)
-		// Currently assuming the file store is "flat", that is IDs are unique across all config types
-		// and that the files for all the types sit next to each other.
-		byAmpId = byId
-		ampIdList = append(ampIdList, byAmpId)
-	}
-	if cfg.Postgres != nil {
-		// Be careful not to log the password here, for security reasons
-		glog.Infof("Loading Stored Requests from Postgres. DB=%s, host=%s, port=%d, user=%s, query=%s", cfg.Postgres.Database, cfg.Postgres.Host, cfg.Postgres.Port, cfg.Postgres.Username, cfg.Postgres.QueryTemplate)
-		byId = db_fetcher.NewFetcher(db, cfg.Postgres.MakeQuery)
-		idList = append(idList, byId)
-		byAmpId = db_fetcher.NewFetcher(db, cfg.Postgres.MakeAmpQuery)
-		ampIdList = append(ampIdList, byAmpId)
-	}
-	if cfg.HTTP != nil {
-		glog.Infof("Loading Stored Requests via HTTP. endpoint=%s, amp_endpoint=%s", cfg.HTTP.Endpoint, cfg.HTTP.AmpEndpoint)
-		byId = http_fetcher.NewFetcher(nil, cfg.HTTP.Endpoint)
-		idList = append(idList, byId)
-		byAmpId = http_fetcher.NewFetcher(nil, cfg.HTTP.AmpEndpoint)
-		ampIdList = append(ampIdList, byAmpId)
-	}
-	if len(idList) == 0 {
-		glog.Warning("No Stored Request support configured. request.imp[i].ext.prebid.storedrequest will be ignored. If you need this, check your app config")
-		byId = empty_fetcher.EmptyFetcher()
-		byAmpId = byId
-	} else if len(idList) > 1 {
-		// In the case of len()==1, byId and byAmpId are already set to the correct Fetcher
-		byId = &idList
-		byAmpId = &ampIdList
-	}
-
-	if cfg.InMemoryCache != nil {
-		glog.Infof("Using a Stored Request in-memory cache. Max size for StoredRequests: %d bytes. Max size for Stored Imps: %d bytes. TTL: %d seconds.", cfg.InMemoryCache.RequestCacheSize, cfg.InMemoryCache.ImpCacheSize, cfg.InMemoryCache.TTL)
-		byId = stored_requests.WithCache(byId, in_memory.NewLRUCache(cfg.InMemoryCache))
-		byAmpId = stored_requests.WithCache(byAmpId, in_memory.NewLRUCache(cfg.InMemoryCache))
-	}
-	return
 }

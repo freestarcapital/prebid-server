@@ -19,7 +19,7 @@ import (
 //
 // This file expects the endpoint to satisfy the following API:
 //
-// GET {endpoint}?request-ids=req1,req2&imp-ids=imp1,imp2,imp3
+// GET {endpoint}?request-ids=["req1","req2"]&imp-ids=["imp1","imp2","imp3"]
 //
 // This endpoint should return a payload like:
 //
@@ -36,7 +36,7 @@ import (
 // }
 //
 //
-func NewFetcher(client *http.Client, endpoint string) *httpFetcher {
+func NewFetcher(client *http.Client, endpoint string) *HttpFetcher {
 	// Do some work up-front to figure out if the (configurable) endpoint has a query string or not.
 	// When we build requests, we'll either want to add `?request-ids=...&imp-ids=...` _or_
 	// `&request-ids=...&imp-ids=...`, depending.
@@ -49,24 +49,24 @@ func NewFetcher(client *http.Client, endpoint string) *httpFetcher {
 
 	glog.Info("Making http_fetcher which calls GET " + urlPrefix + "request-ids=%REQUEST_ID_LIST%&imp-ids=%IMP_ID_LIST%")
 
-	return &httpFetcher{
+	return &HttpFetcher{
 		client:   client,
-		endpoint: urlPrefix,
+		Endpoint: urlPrefix,
 	}
 }
 
-type httpFetcher struct {
+type HttpFetcher struct {
 	client   *http.Client
-	endpoint string
+	Endpoint string
 	hasQuery bool
 }
 
-func (fetcher *httpFetcher) FetchRequests(ctx context.Context, requestIDs []string, impIDs []string) (requestData map[string]json.RawMessage, impData map[string]json.RawMessage, errs []error) {
+func (fetcher *HttpFetcher) FetchRequests(ctx context.Context, requestIDs []string, impIDs []string) (requestData map[string]json.RawMessage, impData map[string]json.RawMessage, errs []error) {
 	if len(requestIDs) == 0 && len(impIDs) == 0 {
 		return nil, nil, nil
 	}
 
-	httpReq, err := buildRequest(fetcher.endpoint, requestIDs, impIDs)
+	httpReq, err := buildRequest(fetcher.Endpoint, requestIDs, impIDs)
 	if err != nil {
 		return nil, nil, []error{err}
 	}
@@ -82,11 +82,11 @@ func (fetcher *httpFetcher) FetchRequests(ctx context.Context, requestIDs []stri
 
 func buildRequest(endpoint string, requestIDs []string, impIDs []string) (*http.Request, error) {
 	if len(requestIDs) > 0 && len(impIDs) > 0 {
-		return http.NewRequest("GET", endpoint+"request-ids="+strings.Join(requestIDs, ",")+"&imp-ids="+strings.Join(impIDs, ","), nil)
+		return http.NewRequest("GET", endpoint+"request-ids=[\""+strings.Join(requestIDs, "\",\"")+"\"]&imp-ids=[\""+strings.Join(impIDs, "\",\"")+"\"]", nil)
 	} else if len(requestIDs) > 0 {
-		return http.NewRequest("GET", endpoint+"request-ids="+strings.Join(requestIDs, ","), nil)
+		return http.NewRequest("GET", endpoint+"request-ids=[\""+strings.Join(requestIDs, "\",\"")+"\"]", nil)
 	} else {
-		return http.NewRequest("GET", endpoint+"imp-ids="+strings.Join(impIDs, ","), nil)
+		return http.NewRequest("GET", endpoint+"imp-ids=[\""+strings.Join(impIDs, "\",\"")+"\"]", nil)
 	}
 }
 
