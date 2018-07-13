@@ -14,40 +14,9 @@ This endpoint runs an auction with the given OpenRTB 2.5 bid request.
 
 ### Sample request
 
-The following is a "hello world" request which fetches the [Prebid sample ad](http://prebid.org/examples/pbjs_demo.html).
+The [Prebid sample ad](http://prebid.org/examples/pbjs_demo.html) can be loaded with the request sample [here](../../../endpoints/openrtb2/sample-requests/valid-whole/exemplary/prebid-test-ad.json).
 
-```
-{
-  "id": "some-request-id",
-  "site": {
-    "page": "prebid.org"
-  },
-  "imp": [
-    {
-      "id": "some-impression-id",
-      "banner": {
-        "format": [
-          {
-            "w": 300,
-            "h": 250
-          },
-          {
-            "w": 300,
-            "h": 600
-          }
-        ]
-      },
-      "ext": {
-        "appnexus": {
-          "placementId": 10433394
-        }
-      }
-    }
-  ],
-  "test": 1,
-  "tmax": 500
-}
-```
+Other examples can be found in [endpoints/openrtb2/sample-requests/valid-whole/exemplary](../../../endpoints/openrtb2/sample-requests/valid-whole/exemplary).
 
 ### Sample Response
 
@@ -56,7 +25,7 @@ This endpoint will respond with either:
 - An OpenRTB 2.5 BidResponse, or
 - An HTTP 400 status code if the request is malformed
 
-See below for a "hello world" response.
+A "hello world" response from the prebid sample ad request is shown below.
 
 ```
 {
@@ -69,7 +38,7 @@ See below for a "hello world" response.
           "id": "4625436751433509010",
           "impid": "some-impression-id",
           "price": 0.5,
-          "adm": "<script type=\"application/javascript\">...</script>",
+          "adm": "<script type=\"application/javascript\">... the creative javascript is in here ... </script>",
           "adid": "29681110",
           "adomain": [
             "appnexus.com"
@@ -113,6 +82,20 @@ The only exception here is the top-level `BidResponse`, because it's bidder-inde
 
 Exceptions are made for DigiTrust and GDPR, so that we define `ext` according to the official recommendations.
 
+#### Bid Adjustments
+
+Bidders [are encouraged](../../developers/add-new-bidder.md) to make Net bids. However, there's no way for Prebid to enforce this.
+If you find that some bidders use Gross bids, publishers can adjust for it with `request.ext.prebid.bidadjustmentfactors`:
+
+```
+{
+  "appnexus: 0.8,
+  "rubicon": 0.7
+}
+```
+
+This may also be useful for publishers who want to account for different discrepancies with different bidders.
+
 #### Targeting
 
 Targeting refers to strings which are sent to the adserver to
@@ -125,10 +108,24 @@ to set these params on the response at `response.seatbid[i].bid[j].ext.prebid.ta
 
 ```
 {
-  "pricegraularity": "One of ['low', 'med', 'high', 'auto', 'dense']", // Required property.
-  "includewinners": false // Optional param defaulting to true
+    "pricegranularity": {
+        "precision": 2,
+        "ranges": [
+            {
+                "max":20.00,
+                "increment":0.10 // This is equivalent to the deprecated "pricegranularity": "medium"
+            }
+        ]
+    },
+    "includewinners": false // Optional param defaulting to true
+    "includebidderkeys": false // Optional param defaulting to true
 }
 ```
+The list of price granularity ranges must be given in order of increasing `max` values. If `precision` is omitted, it will default to `2`. The minimum of a range will be 0 or the previous `max`. Any cmp above the largest `max` will go in the `max` pricebucket.
+
+For backwards compatibility the following strings will also be allowed as price granularity definitions. There is no guarantee that these will be honored in the future. "One of ['low', 'med', 'high', 'auto', 'dense']" See [price granularity definitions](http://prebid.org/prebid-mobile/adops-price-granularity.html)
+
+One of "includewinners" or "includebidderkeys" must be true (both default to true if unset). If both were false, then no targeting keys would be set, which is better configured by omitting targeting altogether.
 
 **Response format** (returned in `bid.ext.prebid.targeting`)
 
@@ -321,6 +318,16 @@ The error message in the response should describe how to "fix" the request to ma
 If the message is unclear, please [log an issue](https://github.com/prebid/prebid-server/issues)
 or [submit a pull request](https://github.com/prebid/prebid-server/pulls) to improve it.
 
+#### Determining Bid Security (http/https)
+
+In the OpenRTB spec, `request.imp[i].secure` says:
+
+> Flag to indicate if the impression requires secure HTTPS URL creative assets and markup,
+> where 0 = non-secure, 1 = secure. If omitted, the secure state is unknown, but non-secure
+> HTTP support can be assumed.
+
+In Prebid Server, an `https` request which does not define `secure` will be forwarded to Bidders with a `1`.
+Publishers who run `https` sites and want insecure ads can still set this to `0` explicitly.
 
 ### See also
 

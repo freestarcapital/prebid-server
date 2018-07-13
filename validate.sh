@@ -20,7 +20,6 @@ done
 die() { echo -e "$@" 1>&2 ; exit 1;  }
 
 # Build a list of all the top-level directories in the project.
-GOGLOB="*.go"
 for DIRECTORY in */ ; do
   GOGLOB="$GOGLOB ${DIRECTORY%/}"
 done
@@ -39,7 +38,7 @@ if $AUTOFMT; then
     done
   fi
 else
-  test $GOFMT_LINES -eq 0 || die "gofmt needs to be run, ${GOFMT_LINES} files have issues.  Below is a list of files to review:\n`gofmt -l *.go pbs adapters`"
+  test $GOFMT_LINES -eq 0 || die "gofmt needs to be run, ${GOFMT_LINES} files have issues.  Below is a list of files to review:\n`gofmt -l $GOGLOB`"
 fi
 
 # Run the actual tests. Make sure there's enough coverage too, if the flags call for it.
@@ -58,6 +57,10 @@ if [ "$RACE" -ne "0" ]; then
 fi
 
 if $VET; then
+  # Fix for the go 1.10 vet bug (https://github.com/w0rp/ale/issues/1358)
+  COMMAND="go tool vet -source *.go"
+  echo "Running: $COMMAND"
+  `$COMMAND`
   for SOURCE in $GOGLOB ; do
     # default call for wildcards and directories
     COMMAND="go tool vet -source $SOURCE"
