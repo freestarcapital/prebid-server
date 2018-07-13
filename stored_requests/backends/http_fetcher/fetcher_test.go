@@ -116,7 +116,7 @@ func (w closeWrapper) Close() error {
 	return nil
 }
 
-func newFetcherBrokenBackend() (fetcher *httpFetcher, closer func()) {
+func newFetcherBrokenBackend() (fetcher *HttpFetcher, closer func()) {
 	handler := func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 	}
@@ -124,13 +124,13 @@ func newFetcherBrokenBackend() (fetcher *httpFetcher, closer func()) {
 	return NewFetcher(server.Client(), server.URL), server.Close
 }
 
-func newEmptyFetcher(t *testing.T, expectReqIDs []string, expectImpIDs []string) (fetcher *httpFetcher, closer func()) {
+func newEmptyFetcher(t *testing.T, expectReqIDs []string, expectImpIDs []string) (fetcher *HttpFetcher, closer func()) {
 	handler := newHandler(t, expectReqIDs, expectImpIDs, jsonifyToNull)
 	server := httptest.NewServer(http.HandlerFunc(handler))
 	return NewFetcher(server.Client(), server.URL), server.Close
 }
 
-func newTestFetcher(t *testing.T, expectReqIDs []string, expectImpIDs []string) (fetcher *httpFetcher, closer func()) {
+func newTestFetcher(t *testing.T, expectReqIDs []string, expectImpIDs []string) (fetcher *HttpFetcher, closer func()) {
 	handler := newHandler(t, expectReqIDs, expectImpIDs, jsonifyID)
 	server := httptest.NewServer(http.HandlerFunc(handler))
 	return NewFetcher(server.Client(), server.URL), server.Close
@@ -142,8 +142,8 @@ func newHandler(t *testing.T, expectReqIDs []string, expectImpIDs []string, json
 		assertMatches(t, query.Get("request-ids"), expectReqIDs)
 		assertMatches(t, query.Get("imp-ids"), expectImpIDs)
 
-		gotReqIDs := strings.Split(query.Get("request-ids"), ",")
-		gotImpIDs := strings.Split(query.Get("imp-ids"), ",")
+		gotReqIDs := richSplit(query.Get("request-ids"))
+		gotImpIDs := richSplit(query.Get("imp-ids"))
 
 		reqIDResponse := make(map[string]json.RawMessage, len(gotReqIDs))
 		impIDResponse := make(map[string]json.RawMessage, len(gotImpIDs))
@@ -177,7 +177,7 @@ func newHandler(t *testing.T, expectReqIDs []string, expectImpIDs []string, json
 func assertMatches(t *testing.T, query string, expected []string) {
 	t.Helper()
 
-	queryVals := strings.Split(query, ",")
+	queryVals := richSplit(query)
 	if len(queryVals) == 1 && queryVals[0] == "" {
 		if len(expected) != 0 {
 			t.Errorf("Expected no query vals, but got %v", queryVals)
@@ -201,6 +201,28 @@ func assertMatches(t *testing.T, query string, expected []string) {
 			t.Errorf("Query string missing expected key %s.", expectedQuery)
 		}
 	}
+}
+
+// Split the id values properly
+func richSplit(queryVal string) []string {
+	// Get rid of the bounding []
+	// Not doing real validation, as this is a test routine, and given a malformed input we want to fail anyway.
+	if len(queryVal) > 2 {
+		queryVal = queryVal[1 : len(queryVal)-1]
+	}
+	values := strings.Split(queryVal, "\",\"")
+	if len(values) > 0 {
+		//Fix leading and trailing "
+		if len(values[0]) > 0 {
+			values[0] = values[0][1:]
+		}
+		l := len(values) - 1
+		if len(values[l]) > 0 {
+			values[l] = values[l][:len(values[l])-1]
+		}
+	}
+
+	return values
 }
 
 func jsonifyID(id string) json.RawMessage {

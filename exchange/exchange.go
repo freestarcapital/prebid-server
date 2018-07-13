@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/prebid/prebid-server/adapters"
+
 	"github.com/golang/glog"
 
 	"github.com/mxmCherry/openrtb"
@@ -96,8 +98,9 @@ func (e *exchange) HoldAuction(ctx context.Context, bidRequest *openrtb.BidReque
 
 		if requestExt.Prebid.Targeting != nil {
 			targData = &targetData{
-				priceGranularity: requestExt.Prebid.Targeting.PriceGranularity,
-				includeWinners:   requestExt.Prebid.Targeting.IncludeWinners,
+				priceGranularity:  requestExt.Prebid.Targeting.PriceGranularity,
+				includeWinners:    requestExt.Prebid.Targeting.IncludeWinners,
+				includeBidderKeys: requestExt.Prebid.Targeting.IncludeBidderKeys,
 			}
 			if shouldCacheBids {
 				targData.includeCache = true
@@ -143,12 +146,17 @@ func (e *exchange) getAllBids(ctx context.Context, cleanRequests map[openrtb_ext
 
 	for bidderName, req := range cleanRequests {
 		// Here we actually call the adapters and collect the bids.
-		go func(aName openrtb_ext.BidderName, coreBidder openrtb_ext.BidderName, request *openrtb.BidRequest, blabels map[openrtb_ext.BidderName]*pbsmetrics.AdapterLabels) {
+		coreBidder := resolveBidder(string(bidderName), aliases)
+		go func(aName openrtb_ext.BidderName, coreBidder openrtb_ext.BidderName, request *openrtb.BidRequest, bidlabels *pbsmetrics.AdapterLabels) {
 			// Passing in aName so a doesn't change out from under the go routine
+			if bidlabels.Adapter == "" {
+				glog.Errorf("Exchange: bidlables for %s (%s) missing adapter string", aName, coreBidder)
+				bidlabels.Adapter = coreBidder
+			}
 			brw := new(bidResponseWrapper)
 			brw.bidder = aName
 			// Defer basic metrics to insure we capture them at the
-			defer e.me.RecordAdapterRequest(*blabels[coreBidder])
+			defer e.me.RecordAdapterRequest(*bidlabels)
 			start := time.Now()
 
 			adjustmentFactor := 1.0
@@ -169,35 +177,22 @@ func (e *exchange) getAllBids(ctx context.Context, cleanRequests map[openrtb_ext
 			ae := new(seatResponseExtra)
 			ae.ResponseTimeMillis = int(elapsed / time.Millisecond)
 			// Timing statistics
-			e.me.RecordAdapterTime(*blabels[coreBidder], time.Since(start))
-			serr := make([]string, len(err))
-			for i := 0; i < len(err); i++ {
-				serr[i] = err[i].Error()
-				// TODO: #142: for a bidder that return multiple errors, we will log multiple errors for that request
-				// in the metrics. Need to remember that in analyzing the data.
-				switch err[i] {
-				case context.DeadlineExceeded:
-					blabels[coreBidder].AdapterStatus = pbsmetrics.AdapterStatusTimeout
-				default:
-					blabels[coreBidder].AdapterStatus = pbsmetrics.AdapterStatusErr
-				}
-			}
+			e.me.RecordAdapterTime(*bidlabels, time.Since(start))
+			serr := errsToStrings(err)
+			bidlabels.AdapterBids = bidsToMetric(bids)
+			bidlabels.AdapterErrors = errorsToMetric(err)
 			// Append any bid validation errors to the error list
 			ae.Errors = serr
 			brw.adapterExtra = ae
-			if len(err) == 0 {
-				if bids == nil || len(bids.bids) == 0 {
-					// Don't want to mark no bids on error topreserve legacy behavior.
-					blabels[coreBidder].AdapterStatus = pbsmetrics.AdapterStatusNoBid
-				} else {
-					for _, bid := range bids.bids {
-						var cpm = float64(bid.bid.Price * 1000)
-						e.me.RecordAdapterPrice(*blabels[coreBidder], cpm)
-					}
+			if bids != nil {
+				for _, bid := range bids.bids {
+					var cpm = float64(bid.bid.Price * 1000)
+					e.me.RecordAdapterPrice(*bidlabels, cpm)
+					e.me.RecordAdapterBidReceived(*bidlabels, bid.bidType, bid.bid.AdM != "")
 				}
 			}
 			chBids <- brw
-		}(bidderName, resolveBidder(string(bidderName), aliases), req, blabels)
+		}(bidderName, coreBidder, req, blabels[coreBidder])
 	}
 	// Wait for the bidders to do their thing
 	for i := 0; i < len(cleanRequests); i++ {
@@ -207,6 +202,44 @@ func (e *exchange) getAllBids(ctx context.Context, cleanRequests map[openrtb_ext
 	}
 
 	return adapterBids, adapterExtra
+}
+
+func bidsToMetric(bids *pbsOrtbSeatBid) pbsmetrics.AdapterBid {
+	if bids == nil || len(bids.bids) == 0 {
+		return pbsmetrics.AdapterBidNone
+	}
+	return pbsmetrics.AdapterBidPresent
+}
+
+func errorsToMetric(errs []error) map[pbsmetrics.AdapterError]struct{} {
+	if len(errs) == 0 {
+		return nil
+	}
+	ret := make(map[pbsmetrics.AdapterError]struct{}, len(errs))
+	var s struct{}
+	for _, err := range errs {
+		if err == context.DeadlineExceeded {
+			ret[pbsmetrics.AdapterErrorTimeout] = s
+		} else {
+			switch err.(type) {
+			case *adapters.BadInputError:
+				ret[pbsmetrics.AdapterErrorBadInput] = s
+			case *adapters.BadServerResponseError:
+				ret[pbsmetrics.AdapterErrorBadServerResponse] = s
+			default:
+				ret[pbsmetrics.AdapterErrorUnknown] = s
+			}
+		}
+	}
+	return ret
+}
+
+func errsToStrings(errs []error) []string {
+	serr := make([]string, len(errs))
+	for i := 0; i < len(errs); i++ {
+		serr[i] = errs[i].Error()
+	}
+	return serr
 }
 
 // This piece takes all the bids supplied by the adapters and crafts an openRTB response to send back to the requester
@@ -336,6 +369,9 @@ func (brw *bidResponseWrapper) validateBids() (err []error) {
 	if brw.adapterBids == nil || len(brw.adapterBids.bids) == 0 {
 		return
 	}
+	// TODO #280: Exit if there is a currency mismatch between currencies passed in bid request
+	// and the currency received in the bid.
+	// Check also if the currency received exists.
 	err = make([]error, 0, len(brw.adapterBids.bids))
 	validBids := make([]*pbsOrtbBid, 0, len(brw.adapterBids.bids))
 	for _, bid := range brw.adapterBids.bids {
@@ -364,12 +400,11 @@ func validateBid(bid *pbsOrtbBid) (bool, error) {
 	if bid.bid.ImpID == "" {
 		return false, fmt.Errorf("Bid \"%s\" missing required field 'impid'", bid.bid.ID)
 	}
-	if bid.bid.Price == 0.0 {
-		return false, fmt.Errorf("Bid \"%s\" missing required field 'price'", bid.bid.ID)
+	if bid.bid.Price <= 0.0 {
+		return false, fmt.Errorf("Bid \"%s\" does not contain a positive 'price'", bid.bid.ID)
 	}
-	// TODO #427: Check creative ID after Bidders have had time to start returning it.
-	// if bid.bid.CrID == "" {
-	// 	return false, fmt.Errorf("Bid \"%s\" missing creative ID", bid.bid.ID)
-	// }
+	if bid.bid.CrID == "" {
+		return false, fmt.Errorf("Bid \"%s\" missing creative ID", bid.bid.ID)
+	}
 	return true, nil
 }
