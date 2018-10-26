@@ -2,3 +2,9 @@ cache:
   scheme: https
   host: prebid-cache.pub.network
   query: uuid=%PBS_CACHE_UUID%
+adapters:
+  rubicon:
+    usersync_url: http://pixel.rubiconproject.com/sync.php?p=prebid
+    xapi:
+      username: freestarmedia
+      password: YUG3546FGR
